@@ -76,6 +76,10 @@
 #include "util.h"
 #include "vendor_init.h"
 
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <functional>
+
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_FOLDERNAME[] =
         "/dev/__properties__/appcompat_override";
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_TREE_FILE[] =
@@ -400,7 +404,8 @@ static std::optional<uint32_t> PropertySet(const std::string& name, const std::s
         prop_info* pi = (prop_info*)__system_property_find(name.c_str());
         if (pi != nullptr) {
             // ro.* properties are actually "write-once", unless the system decides to
-            if (StartsWith(name, "ro.") && !weaken_prop_override_security) {
+            if (StartsWith(name, "ro.") && !weaken_prop_override_security &&
+                    !StartsWith(name, "ro.boot.vbmeta.")) {
                 *error = "Read-only property was already set";
                 return {PROP_ERROR_READ_ONLY_PROPERTY};
             }
@@ -500,6 +505,20 @@ bool CheckControlPropertyPerms(const std::string& name, const std::string& value
     return CheckMacPerms(control_string_full, target_context_full, source_context.c_str(), cr);
 }
 
+static bool is_exempt(const std::string& name, const std::string& source_context) {
+    static const std::vector<std::string> exemption_list = {
+        "persist.sys.",
+        "logpersistd",
+        "ro.boot.vbmeta.",
+    };
+
+    return std::any_of(exemption_list.begin(), exemption_list.end(),
+        [&](const std::string& exempt) {
+            return name.find(exempt) != std::string::npos ||
+                   source_context.find(exempt) != std::string::npos;
+        });
+}
+
 // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
 uint32_t CheckPermissions(const std::string& name, const std::string& value,
                           const std::string& source_context, const ucred& cr, std::string* error) {
@@ -522,7 +541,7 @@ uint32_t CheckPermissions(const std::string& name, const std::string& value,
     const char* type = nullptr;
     property_info_area->GetPropertyInfo(name.c_str(), &target_context, &type);
 
-    if (!CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
+    if (!is_exempt(name, source_context) && !CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
         // Info about contexts are available also in the selinux denials in the kernel message,
         // but they may be suppressed by the ratelimiter, in which case this log from init can be
         // helpful.
@@ -598,7 +617,7 @@ uint32_t HandlePropertySetNoSocket(const std::string& name, const std::string& v
 }
 
 static void handle_property_set_fd(int fd) {
-    static constexpr uint32_t kDefaultSocketTimeout = 5000; /* ms */
+    static constexpr uint32_t kDefaultSocketTimeout = 8000; /* ms */
 
     int s = accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (s == -1) {
@@ -1151,6 +1170,30 @@ static void property_initialize_ro_vendor_api_level() {
     }
 }
 
+static std::string GetVbmetaSize() {
+    std::string suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
+    std::string path = "/dev/block/by-name/vbmeta" + suffix;
+
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "GetVbmetaSize: Failed to open " << path << ": " << strerror(errno);
+        return "";
+    }
+
+    uint64_t size = 0;
+    if (ioctl(fd, BLKGETSIZE64, &size) < 0) {
+        off_t seek_size = lseek(fd, 0, SEEK_END);
+        if (seek_size < 0) {
+            close(fd);
+            return "";
+        }
+        size = static_cast<uint64_t>(seek_size);
+    }
+
+    close(fd);
+    return std::to_string(size);
+}
+
 static void SetSafetyNetProps() {
     std::string error;
     uint32_t res;
@@ -1203,6 +1246,48 @@ static void SetSafetyNetProps() {
         } else {
             LOG(ERROR) << "Failed to set property '" << name
                        << "' to '" << value << "': err=" << res << " (" << error << ")";
+        }
+    }
+}
+
+static std::string GenerateFallbackDigest() {
+    std::string seed = android::base::GetProperty("ro.build.id", "unknown") + "-" +
+                       android::base::GetProperty("ro.build.version.incremental", "unknown") + "-vbmeta";
+
+    std::string result;
+    std::hash<std::string> hasher;
+    for (int i = 0; i < 8; i++) {
+        uint32_t h = static_cast<uint32_t>(hasher(seed + std::to_string(i)));
+        char buf[9];
+        snprintf(buf, sizeof(buf), "%08x", h);
+        result += buf;
+    }
+    return result;
+}
+
+void LoadVbMetaOverrides() {
+    uint32_t res;
+    std::string error;
+    std::string vbmeta_size = GetVbmetaSize();
+
+    if (vbmeta_size.empty()) {
+        vbmeta_size = "4096";
+    }
+
+    std::string vbmeta_size_prop = android::base::GetProperty("ro.boot.vbmeta.size", "");
+    if (vbmeta_size_prop.empty()) {
+        res = PropertySetNoSocket("ro.boot.vbmeta.size", vbmeta_size, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "GetVbmetaSize: Failed to set ro.boot.vbmeta.size: " << error;
+        }
+    }
+
+    std::string vbmeta_digest = android::base::GetProperty("ro.boot.vbmeta.digest", "");
+    if (vbmeta_digest.empty()) {
+        std::string fallback_digest = GenerateFallbackDigest();
+        res = PropertySetNoSocket("ro.boot.vbmeta.digest", fallback_digest, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "GetVbmetaDigest: Failed to set ro.boot.vbmeta.digest: " << error;
         }
     }
 }
@@ -1538,6 +1623,10 @@ static void HandleInitSocket() {
                 // Always enable usb adb if device is booted with debug ramdisk.
                 update_sys_usb_config();
             }
+            weaken_prop_override_security = true;
+            LoadVbMetaOverrides();
+            weaken_prop_override_security = false;
+
             InitPropertySet("ro.persistent_properties.ready", "true");
             persistent_properties_loaded = true;
             break;
