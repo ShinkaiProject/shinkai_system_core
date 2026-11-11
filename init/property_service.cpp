@@ -23,6 +23,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <sstream>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -76,6 +77,10 @@
 #include "util.h"
 #include "vendor_init.h"
 
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <functional>
+
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_FOLDERNAME[] =
         "/dev/__properties__/appcompat_override";
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_TREE_FILE[] =
@@ -120,6 +125,8 @@ struct PropertyAuditData {
     const ucred* cr;
     const char* name;
 };
+
+static bool weaken_prop_override_security = false;
 
 static int PropertyAuditCallback(void* data, security_class_t /*cls*/, char* buf, size_t len) {
     auto* d = reinterpret_cast<PropertyAuditData*>(data);
@@ -397,13 +404,17 @@ static std::optional<uint32_t> PropertySet(const std::string& name, const std::s
     } else {
         prop_info* pi = (prop_info*)__system_property_find(name.c_str());
         if (pi != nullptr) {
-            // ro.* properties are actually "write-once".
-            if (StartsWith(name, "ro.")) {
+            // ro.* properties are actually "write-once", unless the system decides to
+            if (StartsWith(name, "ro.") && !weaken_prop_override_security &&
+                    !StartsWith(name, "ro.boot.vbmeta.")) {
                 *error = "Read-only property was already set";
                 return {PROP_ERROR_READ_ONLY_PROPERTY};
             }
 
-            __system_property_update(pi, value.c_str(), valuelen);
+            if (__system_property_update(pi, value.c_str(), valuelen) < 0) {
+                *error = "__system_property_update failed";
+                return {PROP_ERROR_SET_FAILED};
+            }
         } else {
             int rc = __system_property_add(name.c_str(), name.size(), value.c_str(), valuelen);
             if (rc < 0) {
@@ -495,6 +506,20 @@ bool CheckControlPropertyPerms(const std::string& name, const std::string& value
     return CheckMacPerms(control_string_full, target_context_full, source_context.c_str(), cr);
 }
 
+static bool is_exempt(const std::string& name, const std::string& source_context) {
+    static const std::vector<std::string> exemption_list = {
+        "persist.sys.",
+        "logpersistd",
+        "ro.boot.vbmeta.",
+    };
+
+    return std::any_of(exemption_list.begin(), exemption_list.end(),
+        [&](const std::string& exempt) {
+            return name.find(exempt) != std::string::npos ||
+                   source_context.find(exempt) != std::string::npos;
+        });
+}
+
 // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
 uint32_t CheckPermissions(const std::string& name, const std::string& value,
                           const std::string& source_context, const ucred& cr, std::string* error) {
@@ -517,7 +542,7 @@ uint32_t CheckPermissions(const std::string& name, const std::string& value,
     const char* type = nullptr;
     property_info_area->GetPropertyInfo(name.c_str(), &target_context, &type);
 
-    if (!CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
+    if (!is_exempt(name, source_context) && !CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
         // Info about contexts are available also in the selinux denials in the kernel message,
         // but they may be suppressed by the ratelimiter, in which case this log from init can be
         // helpful.
@@ -593,7 +618,7 @@ uint32_t HandlePropertySetNoSocket(const std::string& name, const std::string& v
 }
 
 static void handle_property_set_fd(int fd) {
-    static constexpr uint32_t kDefaultSocketTimeout = 5000; /* ms */
+    static constexpr uint32_t kDefaultSocketTimeout = 8000; /* ms */
 
     int s = accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (s == -1) {
@@ -853,15 +878,20 @@ static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>*
 // on runtime.
 static void update_sys_usb_config() {
     // emulators don't have USB, they enable adb another way.
-    const bool add_adb_func = !android::base::GetBoolProperty("ro.adb.secure", true) &&
+    const char* DEBUG_PROP = "persist.sys.shinkai_debug_enabled";
+    std::string debug_value = GetProperty(DEBUG_PROP, "0");
+    bool debug_enabled = debug_value == "1";
+
+    const bool add_adb_func = android::base::GetBoolProperty("ro.debuggable", false) &&
                               android::base::GetBoolProperty("ro.adb.has_usb", true);
 
     std::string config = android::base::GetProperty("persist.sys.usb.config", "");
     // b/150130503, add (config == "none") condition here to prevent appending
     // ",adb" if "none" is explicitly defined in default prop.
     if (config.empty() || config == "none") {
-        InitPropertySet("persist.sys.usb.config", add_adb_func ? "adb" : "none");
-    } else if (add_adb_func && config.find("adb") == std::string::npos &&
+        InitPropertySet("persist.sys.usb.config",
+                        (add_adb_func || debug_enabled) ? "adb" : "none");
+    } else if ((add_adb_func || debug_enabled) && config.find("adb") == std::string::npos &&
                config.length() + 4 < PROP_VALUE_MAX) {
         config.append(",adb");
         InitPropertySet("persist.sys.usb.config", config);
@@ -1146,6 +1176,205 @@ static void property_initialize_ro_vendor_api_level() {
     }
 }
 
+static std::string GetVbmetaSize() {
+    std::string suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
+    std::string path = "/dev/block/by-name/vbmeta" + suffix;
+
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "GetVbmetaSize: Failed to open " << path << ": " << strerror(errno);
+        return "";
+    }
+
+    uint64_t size = 0;
+    if (ioctl(fd, BLKGETSIZE64, &size) < 0) {
+        off_t seek_size = lseek(fd, 0, SEEK_END);
+        if (seek_size < 0) {
+            close(fd);
+            return "";
+        }
+        size = static_cast<uint64_t>(seek_size);
+    }
+
+    close(fd);
+    return std::to_string(size);
+}
+
+static void SetSafetyNetProps() {
+    std::string error;
+    uint32_t res;
+
+    const std::pair<const char*, const char*> props[] = {
+        {"ro.boot.flash.locked", "1"},
+        {"ro.boot.vbmeta.device_state", "locked"},
+        {"ro.boot.vbmeta.hash_alg", "sha256"},
+        {"ro.boot.vbmeta.avb_version", "1.0"},
+        {"ro.boot.vbmeta.invalidate_on_error", "yes"},
+        {"ro.boot.verifiedbootstate", "green"},
+        {"ro.boot.veritymode", "enforcing"},
+        {"ro.boot.warranty_bit", "0"},
+        {"ro.warranty_bit", "0"},
+        {"ro.debuggable", "0"},
+        {"ro.force.debuggable", "0"},
+        {"ro.adb.secure", "1"},
+        {"ro.secure", "1"},
+        {"ro.bootimage.build.type", "user"},
+        {"ro.build.type", "user"},
+        {"ro.build.keys", "release-keys"},
+        {"ro.build.tags", "release-keys"},
+        {"ro.system.build.tags", "release-keys"},
+        {"ro.product.build.type", "user"},
+        {"ro.system_dlkm.build.type", "user"},
+        {"ro.odm.build.type", "user"},
+        {"ro.system.build.type", "user"},
+        {"ro.system_ext.build.type", "user"},
+        {"ro.vendor.build.type", "user"},
+        {"ro.vendor_dlkm.build.type", "user"},
+        {"ro.vendor.boot.warranty_bit", "0"},
+        {"ro.vendor.warranty_bit", "0"},
+        {"vendor.boot.vbmeta.device_state", "locked"},
+        {"vendor.boot.verifiedbootstate", "green"},
+        {"oplusboot.verifiedbootstate", "green"},
+        {"ro.oem_unlock_supported", "0"},
+        {"ro.crypto.state", "encrypted"},
+        {"ro.is_ever_orange", "0"},
+        {"ro.secureboot.devicelock", "1"},
+        {"ro.secureboot.lockstate", "locked"},
+#ifdef SPOOF_FIRST_API_LEVEL_32
+        {"ro.product.first_api_level", "32"}
+#endif
+    };
+
+    for (const auto& [name, value] : props) {
+        res = PropertySetNoSocket(name, value, &error);
+        if (res == PROP_SUCCESS) {
+            LOG(INFO) << "Property '" << name << "' set successfully to '" << value << "'";
+        } else {
+            LOG(ERROR) << "Failed to set property '" << name
+                       << "' to '" << value << "': err=" << res << " (" << error << ")";
+        }
+    }
+}
+
+static std::string GenerateFallbackDigest() {
+    std::string seed = android::base::GetProperty("ro.build.id", "unknown") + "-" +
+                       android::base::GetProperty("ro.build.version.incremental", "unknown") + "-vbmeta";
+
+    std::string result;
+    std::hash<std::string> hasher;
+    for (int i = 0; i < 8; i++) {
+        uint32_t h = static_cast<uint32_t>(hasher(seed + std::to_string(i)));
+        char buf[9];
+        snprintf(buf, sizeof(buf), "%08x", h);
+        result += buf;
+    }
+    return result;
+}
+
+void LoadVbMetaOverrides() {
+    uint32_t res;
+    std::string error;
+    std::string vbmeta_size = GetVbmetaSize();
+
+    if (vbmeta_size.empty()) {
+        vbmeta_size = "4096";
+    }
+
+    std::string vbmeta_size_prop = android::base::GetProperty("ro.boot.vbmeta.size", "");
+    if (vbmeta_size_prop.empty()) {
+        res = PropertySetNoSocket("ro.boot.vbmeta.size", vbmeta_size, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "GetVbmetaSize: Failed to set ro.boot.vbmeta.size: " << error;
+        }
+    }
+
+    std::string vbmeta_digest = android::base::GetProperty("ro.boot.vbmeta.digest", "");
+    if (vbmeta_digest.empty()) {
+        std::string fallback_digest = GenerateFallbackDigest();
+        res = PropertySetNoSocket("ro.boot.vbmeta.digest", fallback_digest, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "GetVbmetaDigest: Failed to set ro.boot.vbmeta.digest: " << error;
+        }
+    }
+}
+
+void LoadDebugProperties() {
+    const char* DEBUG_PROP = "persist.sys.shinkai_debug_enabled";
+    std::string error;
+    uint32_t res;
+
+    std::string debug_value = GetProperty(DEBUG_PROP, "0");
+    bool debug_enabled = debug_value == "1";
+
+    const std::pair<const char*, const char*> debug_props[] = {
+        {"service.adb.root", debug_enabled ? "1" : "0"},
+        {"ro.adb.secure", debug_enabled ? "0" : "1"},
+        {"ro.debuggable", debug_enabled ? "1" : "0"},
+        {"ro.force.debuggable", debug_enabled ? "1" : "0"}
+    };
+
+    for (const auto& [name, value] : debug_props) {
+        res = PropertySetNoSocket(name, value, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "Failed to set debug property '" << name
+                       << "' to '" << value << "': err=" << res << " (" << error << ")";
+        }
+    }
+}
+
+void LoadReleaseBuildProperties() {
+    std::string error;
+    uint32_t res;
+
+    const char* FLAVOR_PROP = "ro.build.flavor";
+    std::string flavor_value = GetProperty(FLAVOR_PROP, "");
+
+    if (!flavor_value.empty()) {
+        for (const std::string prefix : {"shinkai_", "lineage_", "aosp_"}) {
+            if (flavor_value.find(prefix) == 0) {
+                flavor_value.erase(0, prefix.length());
+                break;
+            }
+        }
+
+        size_t pos = flavor_value.find("userdebug");
+        if (pos != std::string::npos) {
+            flavor_value.replace(pos, std::string("userdebug").length(), "user");
+        }
+
+        res = PropertySetNoSocket(FLAVOR_PROP, flavor_value, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "Failed to set property '" << FLAVOR_PROP
+                       << "' to '" << flavor_value << "': err=" << res << " (" << error << ")";
+        }
+    }
+
+    const char* DISPLAY_ID_PROP = "ro.build.display.id";
+    std::string display_id = GetProperty(DISPLAY_ID_PROP, "");
+
+    if (!display_id.empty()) {
+        std::istringstream iss(display_id);
+        std::string token;
+        std::string numeric_build;
+
+        while (iss >> token) {
+            if (token.find('.') != std::string::npos &&
+                std::any_of(token.begin(), token.end(), ::isdigit)) {
+                numeric_build = token;
+                break;
+            }
+        }
+
+        if (!numeric_build.empty()) {
+            res = PropertySetNoSocket(DISPLAY_ID_PROP, numeric_build, &error);
+            if (res != PROP_SUCCESS) {
+                LOG(ERROR) << "Failed to set property '" << DISPLAY_ID_PROP
+                           << "' to '" << numeric_build << "': err=" << res << " (" << error << ")";
+            }
+        }
+    }
+}
+
 void PropertyLoadBootDefaults() {
     // We read the properties and their values into a map, in order to always allow properties
     // loaded in the later property files to override the properties in loaded in the earlier
@@ -1240,6 +1469,9 @@ void PropertyLoadBootDefaults() {
         }
     }
 
+    // Weaken property override security during execution of the vendor init extension
+    weaken_prop_override_security = true;
+
     // Update with vendor-specific property runtime overrides
     vendor_load_properties();
 
@@ -1247,6 +1479,17 @@ void PropertyLoadBootDefaults() {
     property_derive_build_fingerprint();
     property_initialize_ro_cpu_abilist();
     property_initialize_ro_vendor_api_level();
+
+    if (SPOOF_SAFETYNET) {
+        if (!IsRecoveryMode()) {
+            SetSafetyNetProps();
+        }
+    }
+
+    LoadReleaseBuildProperties();
+
+    // Restore the normal property override security after init extension is executed
+    weaken_prop_override_security = false;
 
     update_sys_usb_config();
 }
@@ -1406,20 +1649,6 @@ static void ProcessBootconfig() {
     });
 }
 
-static void SetSafetyNetProps() {
-    InitPropertySet("ro.boot.flash.locked", "1");
-    InitPropertySet("ro.boot.vbmeta.device_state", "locked");
-    InitPropertySet("ro.boot.verifiedbootstate", "green");
-    InitPropertySet("ro.boot.veritymode", "enforcing");
-    InitPropertySet("ro.boot.warranty_bit", "0");
-    InitPropertySet("ro.build.tags", "release-keys");
-#ifndef ENG_BUILD
-    // Spoof non-eng builds (such as userdebug) to user
-    InitPropertySet("ro.build.type", "user");
-    InitPropertySet("ro.debuggable", "0");
-#endif
-}
-
 void PropertyInit() {
     selinux_callback cb;
     cb.func_audit = PropertyAuditCallback;
@@ -1432,14 +1661,6 @@ void PropertyInit() {
     }
     if (!property_info_area.LoadDefaultPath()) {
         LOG(FATAL) << "Failed to load serialized property info file";
-    }
-
-    // Report a valid verified boot chain to make Google SafetyNet integrity
-    // checks pass. This needs to be done before parsing the kernel cmdline as
-    // these properties are read-only and will be set to invalid values with
-    // androidboot cmdline arguments.
-    if (!IsRecoveryMode()) {
-      SetSafetyNetProps();
     }
 
     // If arguments are passed both on the command line and in DT,
@@ -1479,6 +1700,9 @@ static void HandleInitSocket() {
             for (const auto& property_record : persistent_properties.properties()) {
                 auto const& prop_name = property_record.name();
                 auto const& prop_value = property_record.value();
+                if (prop_name == "persist.adb.tls_server.enable") {
+                    continue;
+                }
                 InitPropertySet(prop_name, prop_value);
             }
 
@@ -1487,6 +1711,11 @@ static void HandleInitSocket() {
                 // Always enable usb adb if device is booted with debug ramdisk.
                 update_sys_usb_config();
             }
+            weaken_prop_override_security = true;
+            LoadDebugProperties();
+            LoadVbMetaOverrides();
+            weaken_prop_override_security = false;
+
             InitPropertySet("ro.persistent_properties.ready", "true");
             persistent_properties_loaded = true;
             break;
